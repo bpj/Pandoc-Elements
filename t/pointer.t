@@ -91,13 +91,18 @@ subtest strict => sub {
               qr{\QNode "quux" doesn't correspond to any key in (sub)pointer "quux" in pointer "quux"\E}
         ],
         [   '/e^f/g/h' =>
-              qr{\QNo list or mapping "/g" in (sub)pointer "/g/h" in  pointer "/e^f/g/h"\E}
+              qr{\QNo list or mapping "/g" in (sub)pointer "/g/h" in pointer "/e^f/g/h"\E}
         ],
     );
     for my $test ( @tests ) {
         my ( $pointer, $regex ) = @$test;
         throws_ok { $doc->value( $pointer, strict => 1 ) } $regex,
           "'$pointer' throws";
+        # # For Pandoc::Metadata::Error
+        # my $exception = $@;
+        # isa_ok $exception, 'Pandoc::Metadata::Error', "'$pointer' exception";
+        # is $exception->{pointer}, $pointer, "'$pointer' pointer";
+        # note explain $exception->data;
     }
 };
 

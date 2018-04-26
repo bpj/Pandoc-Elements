@@ -7,6 +7,8 @@ use Pandoc::Elements;
 use Scalar::Util qw(blessed reftype);
 use JSON::PP;
 use Carp;
+# # For Pandoc::Metadata::Error
+# use Carp qw(shortmess longmess);
 
 # packages and methods
 
@@ -37,7 +39,25 @@ use Carp;
     sub value { shift->value(@_) }
 }
 
+# # For Pandoc::Metadata::Error
+# {
+#     package Pandoc::Metadata::Error;
+#     use overload q[""] => 'shortmess', q[%{}] => 'data', fallback => 1;
+#     use constant { SHORTMESS => 0, LONGMESS => 1, DATA => 2 };
+#     sub new {
+#         my($class, @values) = @_;   # CLASS, (MESSAGE, {DATA})
+#         bless \@values => $class;
+#     }
+#     sub shortmess { shift->[SHORTMESS] }
+#     sub longmess { shift->[LONGMESS] }
+#     sub data { shift->[DATA] }
+#     sub rethrow { die shift }
+#     sub throw { shift->new( @_ )->rethrow }
+# }
+
 # helpers
+
+my @token_keys = qw(last_pointer ref_token old_style key empty pointer);
 
 sub _pointer_token {
     state $valid_pointer_re = qr{\A (?: [^/] .* | (?: / [^/]* )* ) \z}msx;
@@ -56,15 +76,10 @@ sub _pointer_token {
         \z
     }msx;
     # set non-participating keys to undef
-    state $defaults = {
-        map { $_ => undef }
-          qw(_last_pointer _ref_token _old_style _key _empty _pointer)
-    };
+    state $defaults = { map {; "_$_" => undef } @token_keys };
     my %opts = @_;
     $opts{_pointer} //= $opts{_full_pointer} //= $opts{pointer} //= "";
-    $opts{_pointer} =~ $valid_pointer_re
-      // croak( sprintf 'Invalid (sub)pointer: "%s" in pointer "%s"',
-        @opts{qw( _pointer _full_pointer)} );
+    $opts{_pointer} =~ $valid_pointer_re // _bad_pointer( %opts, _error => 'pointer' );
     $opts{_pointer} =~ $token_re; # guaranteed to match since validation matched!
     my %match = %+;
     unless ( grep { defined $_ } @match{qw(_old_style _empty)} ) {
@@ -75,11 +90,49 @@ sub _pointer_token {
 }
 
 sub _bad_pointer {
-    my (%opts) = @_;
+    state $params_for = do {
+        my %params_map = (
+            default => {
+                msg     => 'Invalid or unknown pointer reference "%s"',
+                in      => 1,
+                _keys    => ['_ref_token'],
+                pointer => '_last_pointer'
+            },
+            pointer => { msg => 'Invalid', in => 0, _keys => [], pointer => '_last_pointer', },
+            container => { msg => 'No list or mapping "%s"', },
+            key       => { msg => 'Node "%s" doesn\'t correspond to any key', },
+            range => { msg => 'List index %s out of range', _keys => ['_key'], },
+            index => { msg => 'Node "%s" not a valid list index', },
+        );
+        for my $key ( keys %params_map ) {
+            for my $params ( $params_map{$key} ) {
+                $params = { %{ $params_map{default} }, %$params };
+                $params->{msg} .= ( $params->{in} ? q[ in] : "" );
+                $params->{keys}
+                  = [ @{ $params->{_keys} }, $params->{pointer}, '_full_pointer' ];
+            }
+        }
+        \%params_map;
+    };
+    # # For Pandoc::Metadata::Error
+    # state $data_keys = {
+    #     ( map { ; $_ => $_ } qw[element strict boolean] ),
+    #     ( map { ; $_ => "_$_" } @token_keys, qw[error] ),
+    #     ( pointer => '_full_pointer', next_pointer => '_pointer' ),
+    # };
+    my ( %opts ) = @_;
     return unless $opts{strict};
-    %opts = _pointer_token(%opts);
-    croak(sprintf 'No list or mapping "%s" in (sub)pointer "%s" in  pointer "%s"',
-        @opts{qw(_ref_token _last_pointer _full_pointer)});
+    $opts{_error} //= 'default';
+    my $params = $params_for->{ $opts{_error} };
+    if ( $opts{_error} eq 'container' ) {
+        %opts = _pointer_token( %opts );
+    }
+    my $msg = sprintf $params->{msg} . q[ (sub)pointer "%s" in pointer "%s"], @opts{ @{ $params->{keys} } };
+    # # For Pandoc::Metadata::Error
+    # my %data;
+    # @data{ keys %$data_keys } = @opts{ values %$data_keys };
+    # Pandoc::Metadata::Error->throw( shortmess($msg), longmess($msg), \%data );
+    croak $msg;
 }
 
 # methods
@@ -98,7 +151,7 @@ sub Pandoc::Document::MetaString::value {
     my ($content, %opts) = _value_args(@_);
 
     if ($opts{_pointer} ne '') {
-        _bad_pointer(%opts);
+        _bad_pointer(%opts, _error => 'container');
     } else {
         $content;
     }
@@ -119,7 +172,7 @@ sub Pandoc::Document::MetaBool::value {
     my ($content, %opts) = _value_args(@_);
 
     if ($opts{_pointer} ne '') {
-        _bad_pointer(%opts);
+        _bad_pointer(%opts, _error => 'container');
     } elsif (($opts{boolean} // '') eq 'JSON::PP') {
         $content ? JSON::true() : JSON::false();
     } else {
@@ -135,11 +188,8 @@ sub Pandoc::Document::MetaMap::value {
         return { map { $_ => $map->{$_}->value(%opts) } keys %$map };
     } elsif (exists($map->{$opts{_key}})) {
         return $map->{$opts{_key}}->value(%opts);
-    } elsif ($opts{strict}) {
-       return croak(sprintf 'Node "%s" doesn\'t correspond to any key in (sub)pointer "%s" in pointer "%s"',
-          @opts{qw(_ref_token _last_pointer _full_pointer)})
     } else {
-        return;
+        _bad_pointer( %opts, _error => 'key');
     }
 }
 
@@ -150,17 +200,12 @@ sub Pandoc::Document::MetaList::value {
         return [ map { $_->value(%opts) } @$content ]
     } elsif ($opts{_key} =~ /^[1-9]*[0-9]$/) {
         if ( $opts{_key} > $#$content ) {
-            return unless $opts{strict};
-            croak sprintf 'List index %s out of range in (sub)pointer "%s" in pointer "%s"',
-                @opts{qw(_key _last_pointer _full_pointer)};
+            return _bad_pointer( %opts, _error => 'range' );
         }
         my $value = $content->[$opts{_key}];
         return defined($value) ? $value->value(%opts) : undef;
-    } elsif ($opts{strict}) {
-        croak sprintf 'Node "%s" not a valid list index in (sub)pointer "%s" in pointer "%s"',
-            $opts{_ref_token}, $opts{_last_pointer}, $opts{_full_pointer};
     } else {
-        return;
+        return _bad_pointer( %opts, _error => 'index' );
     }
 }
 
@@ -168,7 +213,7 @@ sub Pandoc::Document::MetaInlines::value {
     my ($content, %opts) = _value_args(@_);
 
     if ($opts{_pointer} ne '') {
-        _bad_pointer(%opts);
+        _bad_pointer(%opts, _error => 'container');
     } elsif ($opts{element} // '' eq 'keep') {
         $content;
     } else {
